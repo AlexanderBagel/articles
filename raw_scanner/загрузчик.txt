@@ -276,6 +276,7 @@ https://learn.microsoft.com/ru-ru/windows/win32/api/winternl/ns-winternl-peb_ldr
 - PEB_LDR_DATA.InInitializationOrderModuleList.FLink указывает на LDR_DATA_TABLE_ENTRY.InInitializationOrderLinks (+ sizeof(LIST_ENTRY) * 2 от начала LDR_DATA_TABLE_ENTRY)
 Проверьте это по картинке, я специально обозначил линки разными цветами, только красные стрелки идут в начало каждой структуры, синяя (означающая список InMemoryOrderLinks) идет со сдвигом, а зеленая, означающая InInitializationOrderLinks мало того что идет с еще большим сдвигом (т.к. она пропускает два двусвязных списка) так еще и всегда указывает на ntdll первым элементом списка, всегда пропуская исполняемый файл.
 
+тут добавить разьяснение по VA адресации
 
 Для чтения данных загрузчика наиболее удобным будет InLoadOrderModuleList. Пишем код:
 
