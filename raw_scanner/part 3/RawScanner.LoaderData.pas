@@ -157,26 +157,6 @@ begin
 end;
 
 function TLoaderData.Scan32LdrData(LdrAddr: ULONG_PTR64): Integer;
-const
-  MM_HIGHEST_USER_ADDRESS = {$IFDEF WIN32}$7FFEFFFF;{$ELSE}$7FFFFFEFFFF;{$ENDIF}
-
-  function IsFile32(const FilePath: string): Boolean;
-  var
-    DosHeader: TImageDosHeader;
-    NtHeader: TImageNtHeaders32;
-    Raw: TBufferedFileStream;
-  begin
-    Raw := TBufferedFileStream.Create(FilePath, fmShareDenyWrite);
-    try
-      Raw.ReadBuffer(DosHeader, SizeOf(TImageDosHeader));
-      Raw.Position := DosHeader._lfanew;
-      Raw.ReadBuffer(NtHeader, SizeOf(TImageNtHeaders32));
-      Result := NtHeader.FileHeader.Machine = IMAGE_FILE_MACHINE_I386;
-    finally
-      Raw.Free;
-    end;
-  end;
-
 var
   Ldr: PEB_LDR_DATA32;
   Entry: LDR_DATA_TABLE_ENTRY32;
