@@ -19,6 +19,8 @@ uses
   function QueryWorkingSet64(hProcess: THandle; pv: Pointer; cb: DWORD): Boolean;
   function GetMappedFileName64(hProcess: THandle; lpv: ULONG_PTR64;
     lpFilename: LPCWSTR; nSize: DWORD): DWORD;
+  function VirtualQueryEx64(hProcess: THandle; lpAddress: ULONG_PTR64;
+    var lpBuffer: TMemoryBasicInformation64; dwLength: NativeUInt): DWORD;
   function GetMappedModule(ProcessHandle: THandle; AddrVa: ULONG_PTR64): string;
   function UnDecorateSymbolName(const Value: string): string;
 
@@ -224,6 +226,55 @@ begin
   {$ELSE}
   Result := QueryWorkingSet(hProcess, pv, cb);
   {$ENDIF}
+end;
+
+function VirtualQueryEx64(hProcess: THandle; lpAddress: ULONG_PTR64;
+  var lpBuffer: TMemoryBasicInformation64; dwLength: NativeUInt): DWORD;
+{$IFDEF WIN32}
+const
+  MemoryBasicInformation = 0;
+var
+  MBI: TMemoryBasicInformation;
+  Status: NTSTATUS;
+  ReturnLength: ULONG64;
+{$ENDIF}
+begin
+{$IFDEF WIN32}
+
+  if lpAddress < MM_HIGHEST_USER_ADDRESS then
+  begin
+    Result := VirtualQueryEx(hProcess, Pointer(lpAddress),
+      MBI, SizeOf(TMemoryBasicInformation));
+    // если вызов успешен, перекидываем данные из 32 битной структуры в 64
+    if Result = SizeOf(TMemoryBasicInformation) then
+    begin
+      Result := SizeOf(TMemoryBasicInformation64);
+      lpBuffer.BaseAddress := ULONG_PTR64(MBI.BaseAddress);
+      lpBuffer.AllocationBase := ULONG_PTR64(MBI.AllocationBase);
+      lpBuffer.AllocationProtect := MBI.AllocationProtect;
+      lpBuffer.RegionSize := ULONG_PTR64(MBI.RegionSize);
+      lpBuffer.State := MBI.State;
+      lpBuffer.Protect := MBI.Protect;
+      lpBuffer.Type_9 := MBI.Type_9;
+    end;
+    Exit;
+  end;
+
+  Result := 0;
+  if Assigned(NtQueryVirtualMemory64) then
+  begin
+    Status := InternalNtQueryVirtualMemory64(hProcess,
+      lpAddress, MemoryBasicInformation, @lpBuffer, dwLength, @ReturnLength);
+    if NT_SUCCESS(Status) then
+      Result := ReturnLength
+    else
+      BaseSetLastNTError(Status);
+  end;
+
+{$ELSE}
+  Result := VirtualQueryEx(hProcess, Pointer(lpAddress),
+    TMemoryBasicInformation(lpBuffer), dwLength);
+{$ENDIF}
 end;
 
 function GetMappedModule(ProcessHandle: THandle; AddrVa: ULONG_PTR64): string;

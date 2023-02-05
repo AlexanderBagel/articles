@@ -6,7 +6,6 @@
 
 uses
   Windows,
-  PsApi,
   System.SysUtils,
   RawScanner.ModulesData in 'RawScanner.ModulesData.pas',
   RawScanner.Types in 'RawScanner.Types.pas',
@@ -40,9 +39,9 @@ begin
   if RawScannerCore.Active then
   try
     RawScannerCore.Analizer.Analyze(
-      // обработка вывода перехваченых таблиц экспорта (импорт будет рассмотрен позже)
+      // обработка вывода перехваченых таблиц экспорта/импорта
       ProcessTableHook,
-      // обработка вывода перехватчиков установленых непосредственно в коде функций (также рассмотрим позже)
+      // обработка вывода перехватчиков установленых непосредственно в коде функций (будет рассмотрен позже)
       nil
       );
 

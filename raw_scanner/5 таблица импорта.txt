@@ -1,0 +1,277 @@
+5. таблица импорта
+
+Импорт в РЕ файлах, в отличие от таблицы экспорта, устроен немного по другому. Во-первых как правило он расположен не в одной, а сразу в двух директориях. Это директория с дескрипторами импорта IMAGE_DIRECTORY_ENTRY_IMPORT и директория с адресами импорта IMAGE_DIRECTORY_ENTRY_IAT.
+Бывают, конечно, исключения когда он умещается только в первой директории, но это редкость. В импорте отсутствует какая-то единая таблица, дело в том что обычно импортируются функции из разных библиотек и для каждой из этих библиотек в директории импорта создается свой дескриптор.
+Каждый дескриптор это структура IMAGE_IMPORT_DESCRIPTOR, чем больше библиотек используются в импорте РЕ файла, тем больше этих структур будет объявлено, причем допускается повторное объявление дескриптора на одну и туже библиотеку, в котором будет описан другой набор импортируемых функций.
+Дескрипторы пишутся последовательно один за одним, от начала директории IMAGE_DIRECTORY_ENTRY_IMPORT, при этом самый последний дескриптор должен содержать в поле Characteristics значение ноль, что означает конец списка дескрипторов.
+
+В дескрипторе интересны три поля.
+1. Name - содержит RVA адрес с Ansi строкой хранящей имя библиотеки. Т.е. грубо переведя его в VA/Raw можно прочитать например "kernel32.dll"
+2. FirstThunk - содержит RVA адрес на первый элемент списка структур IMAGE_THUNK_DATA, каждая из которых в действительности (и по сути) структурой не является, а представляет из себя либо DWORD либо ULONGLONG который хранит некое число, которое трактуется четырьмя разными способами:
+  А: в случае если в числе взведен старший бит, т.е. выполняется условие Value and IMAGE_ORDINAL_FLAGXX <> 0, данное число трактуется как Ordinal, что означает о необходимости загрузки библиотеки по имени Name и поиска функции через GetProcAddress по её порядковому номеру в списке экспорта.
+  Б: в случае если старший бит не взведен, это означает что число содержит RVA адрес на структуру IMAGE_IMPORT_BY_NAME
+  В: если применяется связанный импорт (в статье рассмотрен не будет) данное число трактуется как VA адрес импортируемой функции. Это условие достаточно редко встречается и применимо только для значений списка на который указывает FirstThunk, в списке OriginalFirstThunk не используется.
+  Г: теоретически, в зависимости от значения ForwarderChain дескриптора, может содержать RVA адрес строки перенаправления, но на практике я такого никогда не встречал, не видел упоминания ни в одной статье по РЕ формату и этот вариант рассматривать не будем.
+  Все четыре варианта актуальны только тогда, когда список читается напрямую из файла. Когда он читается из памяти запущеного приложение, в нем всегда будут размещены VA адреса импортируемых функций, модификацией данного списка занимается загрузчик при старте приложения.
+  Конец списка означает элемент со значением ноль.
+  Кстати именно этот список, на который указывает FirstThunk хранится отдельно от директории импорта в специальной директории IMAGE_DIRECTORY_ENTRY_IAT, так называемой Import Address Table. Подозреваю что сделано это для того чтобы не происходило отсоединения таблицы экспорта от механизма шаринга страниц памяти, вынеся все изменяемые загрузчиком поля в отдельный блок памяти в который и происходит запись актуальных данных.
+3. OriginalFirstThunk - все тоже самое что и FirstThunk, только для списков на которые указывает это поле каждого дескриптора актуальны только первые два пункта, т.е. в этих списках никогда не будет VA адресов функций, ни при чтении из файла на диске, ни при чтении из памяти запущенного приложения. Только RVA адрес структуры IMAGE_THUNK_DATA или Ordinal.
+
+А вот IMAGE_THUNK_DATA это простая структура которая состоит из двух полей.
+1. Hint - порядковый номер импортируемой функции в списке экспорта библиотеки по которому её предпочтительней искать. Используется загрузчиком для ускорения поиска импортируемой функции при инициализации таблицы импорта.
+2. Name - Ansi строка завершающаяся нулем, содержащая имя функции.
+
+Вот картинка чтобы было более наглядно:
+
+..\16.png
+
+Синим цветом показаны данные списка OriginalFirstThunk и сам список, обведенный синим квадратом (обращайте внимание на адреса)
+Зеленым показаны данные списка FirstThunk с реальными VA адресами импортируемых функций (ну, точнее всего одной функции).
+Оба списка заканчивается нулем.
+Фиолетовым показан как осуществляется переход на реальный адрес с именем библиотеки, а красный квадрат показывает начало единственной структуры IMAGE_THUNK_DATA, конкретно его поля Hint, которое содержит число 137 (отображенное в подсказке справа).
+
+Из всех этих данных контролировать потребуется только значения, которые содержат списки FirstThunk, т.к. именно правкой этих значений и осуществляется установка перехватчика правкой таблицы импорта.
+
+Итак задача - пробежаться по всем дескрипторам директории импорта и загрузить данные из списков каждого дескриптора.
+Сразу перейдем к коду:
+
+function TRawPEImage.LoadImport(Raw: TStream): Boolean;
+...
+  Result := False;
+  Raw.Position := VaToRaw(FImportDir.VirtualAddress);
+  if Raw.Position = 0 then Exit;
+
+  ZeroMemory(@ImportChunk, SizeOf(TImportChunk));
+  while (Raw.Read(ImageImportDescriptor, SizeOf(TImageImportDescriptor)) =
+    SizeOf(TImageImportDescriptor)) and (ImageImportDescriptor.OriginalFirstThunk <> 0) do
+  begin
+
+    // запоминаем адрес следующего дексриптора
+    NextDescriptorRawAddr := Raw.Position;
+
+    // вычитываем имя библиотеки импорт из которой описывает дескриптор
+    Raw.Position := RvaToRaw(ImageImportDescriptor.Name);
+    if Raw.Position = 0 then
+      Exit;
+
+    // инициализируем размер записей и флаги
+    IatDataSize := IfThen(Image64, 8, 4);
+    OrdinalFlag := IfThen(Image64, IMAGE_ORDINAL_FLAG64, IMAGE_ORDINAL_FLAG32);
+
+    // вычитываем все записи описываемые дескриптором, пока не кончатся
+    IatData := 0;
+    ImportChunk.ImportTableVA := RvaToVa(ImageImportDescriptor.FirstThunk);
+    OriginalFirstThunk := RvaToVa(ImageImportDescriptor.OriginalFirstThunk);
+    if OriginalFirstThunk = 0 then
+      OriginalFirstThunk := ImportChunk.ImportTableVA;
+    repeat
+
+      LastOffset := VaToRaw(OriginalFirstThunk);
+      if LastOffset = 0 then
+        Exit;
+
+      Raw.Position := LastOffset;
+      Raw.ReadBuffer(IatData, IatDataSize);
+
+      if IatData <> 0 then
+      begin
+        // проверка - идет импорт только по ORDINAL или есть имя функции?
+        if IatData and OrdinalFlag = 0 then
+        begin
+          // имя есть - нужно его вытащить
+          Raw.Position := RvaToRaw(IatData);
+          if Raw.Position = 0 then
+            Exit;
+          Raw.ReadBuffer(ImportChunk.Ordinal, SizeOf(Word));
+          ImportChunk.FuncName := ReadString(Raw);
+        end
+        else
+        begin
+          // имени нет - запоминаем только ordinal функции
+          ImportChunk.FuncName := EmptyStr;
+          ImportChunk.Ordinal := IatData and not OrdinalFlag;
+        end;
+
+        FImport.Add(ImportChunk);
+        Inc(ImportChunk.ImportTableVA, IatDataSize);
+        Inc(OriginalFirstThunk, IatDataSize);
+      end;
+    until IatData = 0;
+
+    // переходим к следующему дескриптору
+    Raw.Position := NextDescriptorRawAddr;
+  end;
+
+  Result := ImageImportDescriptor.OriginalFirstThunk = 0;
+end;
+
+Код начинает выполняться с определении Raw адреса директории импорта в физическом файле.
+Скажем так это лишняя перестраховка, т.к. директория импорта как правило всегда в наличии, отсутствует она только у библиотек которые содержат исключительно ресурсы и не имеют исполняемого кода, либо у специально подготовленных исполняемых файлов, в основном написанных на ассемблере, т.к. штатный компилятор врятли вам позволит сотворить такой трюк.
+
+Следующим идет цикл - последовательно считываются все дескрипторы импорта у каждого из которых читается имя описываемой библиотеки, выставляются флаги для детектирования Ordinal значений в списках и размер элементов списка. После чего идет хитрый момент.
+
+В структуре ImportChunk (которая будет содержать данные по каждому элементу из всех таблиц импорта) в поле ImportTableVA запоминается адрес элемента списка из IAT на который указывает FirstThunk (именно его будет контролировать анализатор), но адрес, по которому будет производится реальное чтение из списка забирается из списка OriginalFirstThunk, элементы которого никогда не меняются загрузчиком.
+Это сделано по причине, описанной в пункте "В" чуть выше, а именно потому, что список FirstThunk иногда может содержать VA значения функций, т.е. заранее подготовленные реальные адреса (так называемая привязка).
+Если база загрузки библиотеки равна значению прописанному в IMAGE_OPTIONAL_HEADER, (плюс выполнятся контрольные проверки из BOUND_IMPORT) загрузчик в этом случае пропускает всю настройку таблицы импорта, в противном случае используется список OriginalFirstThunk, на основании данных которого происходит инициализация списка FirstThunk.
+Достаточно редко, но встречается такое, что список OriginalFirstThunk отсутствует. В этом случае его заменяет список FirstThunk и именно это условие учитывается при начале чтения вот в этом коде:
+
+    if OriginalFirstThunk = 0 then
+      OriginalFirstThunk := ImportChunk.ImportTableVA;
+	  
+Если этот список отсутствует, FirstThunk гарантированно будет содержать только те данные, которые должен был содержать OriginalFirstThunk, в противном случае, если бы библиотека загрузилась не по своей базе (или не отработали условия в директории связанного импорта) было бы не возможно инициализировать IAT, на которую указывает FirstThunk, т.к. в этом списке отсутствовали бы RVA адреса на IMAGE_THUNK_DATA.
+
+Ну и в самом конце проверяется условие окончания списка (проверкой на ноль) и если список еще не закончился, читается каждый его элемент либо как Ordinal (c проверкой через наличие флага OrdinalFlag), либо как структура IMAGE_THUNK_DATA, после чего все заносится в список доступный извне.
+
+Выглядит все гораздо проще чем само объяснение.
+
+Прежде чем приступить к коду анализатора полученного импорта, нужно учесть следующие два момента.
+1. Нельзя анализировать таблицы импорта библиотек/исполняемых файлов которые должны работать в нулевом кольце. У таких модулей в РЕ заголовке будет присутствовать флаг IMAGE_SUBSYSTEM_NATIVE. Если вы возразите что такие модули не могут быть загружены в третьем кольце (в котором работает весь прикладной код) я отвечу что это не так. Допустим на Win11 есть такой системный процесс SearchHost и он использует для своей работы библиотеку C:\Windows\System32\LegacySystemSettings.dll у которой (внезапно) в импорте объявлена ntoskrnl.exe экспортирующая функцию wcschr().
+Естественно из-за этой записи ntoskrnl будет подгружен в процесс целиком, но её импорт загрузчик обрабатывать не будет, в противном случае ему пришлось бы подгрузить всё ядро в третье кольцо, а там много чего есть, включая статический импорт из драйверов.
+Поэтому анализатор долже проверять - если на вход пришел модуль с флагом IMAGE_SUBSYSTEM_NATIVE, обработку его импорта производить не нужно.
+2. В процесс могут быть загружены так называемые СОМ+ модули, это библиотеки содержащие только IL код не выполняемый нативно. 
+У таких библиотек в COR20 заголовке выставлен флаг COMIMAGE_FLAGS_ILONLY, а так-же у файла в таблице импорта есть единственная заглушка ведущая на mscoree.dll -> _CorDllMain().
+Загрузчик, при наличии данного флага, не обрабатывает таблицу импорта, что можно наглядно увидеть в "...base\ntdll\ldrapi.c" в функции LdrpLoadDll()
+    {
+      // if the image is COR-ILONLY, then don't walk the import descriptor
+      // as it is assumed that it only imports %windir%\system32\mscoree.dll, otherwise
+      // walk the import descriptor table of the dll.
+    }
+При наличии данного флага также не обрабатывается секция релокации. Однако если библиотека должна загружаться в 32 битное приложение ILAsm может исключить этот флаг, заменив его на COMIMAGE_FLAGS_32BITREQUIRED.
+Определить такие библиотеки можно не только читая COM заголовок, признак не исполняемого IL образа содержится так-же и в флагах таблицы загрузчика LDR_DATA_TABLE_ENTRYxx.Flags and LDRP_COR_IMAGE <> 0, который выставляет при инициализации процесса функция LdrpInitializeProcess().
+Помимо этого у всех этих модулей страница, которой принадлежит адрес точки входа, помечена как не исполняемая.
+Так как импорт не инициализирован, то такие модули так же необходимо пропускать при анализе таблиц импорта.
+
+Вот теперь можно писать код для анализатора. В немного сокращенном виде он выглядит так:
+
+procedure TPatchAnalyzer.ScanImport(Index: Integer; Module: TRawPEImage);
+
+  function CheckRemoteVA: Boolean;
+  begin
+    Result := HookData.Calculated and
+      (HookData.RemoteVA = HookData.RawVA);
+  end;
+
+//...
+begin  
+  if Module.ImportList.Count = 0 then Exit;
+  
+  if Module.NtHeader.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_NATIVE then
+  begin
+    Inc(FAnalizeResult.Import.Skipped, Module.ImportList.Count);
+    Exit;
+  end;
+
+  if Module.ComPlusILOnly then
+  begin
+    if Module.EntryPoint <> 0 then
+      if VirtualQueryEx64(FProcessHandle,
+        Module.EntryPoint, MBI,
+        SizeOf(TMemoryBasicInformation64)) = SizeOf(TMemoryBasicInformation64) then
+        if MBI.Protect and (
+          PAGE_EXECUTE or
+          PAGE_EXECUTE_READ or
+          PAGE_EXECUTE_WRITECOPY or
+          PAGE_EXECUTE_READWRITE) = 0 then
+        begin
+          Inc(FAnalizeResult.Import.Skipped, Module.ImportList.Count);
+          Exit;
+        end;
+  end;
+
+  // подгружаем кэш таблицы импорта, обычно она сидит в секции IAT
+  // но в редких случаях эта секция отсутствует и таблица размещается прямо в секции импорта
+  CacheVA := IfThen(Module.ImportAddressTable.Size = 0,
+    Module.ImportDirectory.VirtualAddress, Module.ImportAddressTable.VirtualAddress);
+  CacheSize := IfThen(Module.ImportAddressTable.Size = 0,
+    Module.ImportDirectory.Size, Module.ImportAddressTable.Size);
+
+  if CacheSize > 0 then
+    AIat := TRemoteStream.Create(FProcessHandle, CacheVA, CacheSize)
+  else
+    Exit;  
+
+  try
+    AddrSize := IfThen(Module.Image64, 8, 4);
+    ZeroMemory(@HookData, SizeOf(THookData));
+    // ...
+
+    for Import in Module.ImportList do
+    begin
+      HookData.FuncName := Import.ToString;
+      HookData.RawVA := 0;
+
+      // зачитываем текущий адрес из таблицы импорта
+      if not AIat.ReadMemory(Import.ImportTableVA, AddrSize, @HookData.RemoteVA) then
+        Continue;
+
+      if Import.FuncName = EmptyStr then
+        HookData.Calculated := FRawModules.GetProcData(Import.LibraryName,
+          Import.Ordinal, Module.Image64, Exp, HookData.RemoteVA)
+      else
+        HookData.Calculated := FRawModules.GetProcData(Import.LibraryName,
+          Import.FuncName, Module.Image64, Exp, HookData.RemoteVA);
+
+      if HookData.Calculated then
+        HookData.RawVA := Exp.FuncAddrVA
+      else
+        if not CheckRemoteVA then
+        begin
+          DoModifyed(HookData);
+          Continue;
+        end;
+
+      if not CheckRemoteVA then
+      begin
+        // если функция перенаправлена, пытаемся её подгрузить
+        if Exp.ForvardedTo <> EmptyStr then
+          if not FRawModules.GetProcData(Exp.ForvardedTo,
+            Module.Image64, Exp, HookData.RemoteVA) then
+          begin
+            HookData.Calculated := False;
+            HookData.ImportAdv.OriginalForvardedTo := Exp.OriginalForvardedTo;
+            HookData.ImportAdv.ForvardedTo := Exp.ForvardedTo;
+            DoModifyed(HookData);
+            Continue;
+          end
+          else
+          begin
+            HookData.RawVA := Exp.FuncAddrVA;
+            HookData.ImportAdv.OriginalForvardedTo := EmptyStr;
+            HookData.ImportAdv.ForvardedTo := EmptyStr;
+          end;
+        if not CheckRemoteVA then
+          DoModifyed(HookData);
+      end;
+    end;
+  finally
+    AIat.Free;
+  end;
+end;
+
+В самом начале идут три проверки:
+1. на наличие импорта
+2. проверка модулей с флагом IMAGE_SUBSYSTEM_NATIVE
+3. проверка COM+ модулей
+
+Далее настраивается кэш, тоже самое было при чтении таблиц экспорта, кэш просто позволит ускорить чтение данных. и он создается с описанным выше нюансом что директория Import Address Table может отсутствовать, в этом случае (как правило) таблица импорта располагается прямо в директории импорта.
+
+После чего идет цикл по всем записям, полученным от всех дескрипторов импорта текущего модуля.
+Сначала читается текущее значение в удаленном адресном пространстве процесса из ранее рассчитанного адреса в списке FirstThunk (этот адрес хранится в ImportTableVA), а потом производится попытка самостоятельного поиска записи об экспортируемой функции в загруженных ранее таблицах экспорта (по Ordinal или по имени).
+
+Если запись нашлась - происходит сравнение результатов, рассчитанного и актуального значений, а если не нашлась то вызывается внешний калбек.
+Причем если запись нашлась, но адреса не совпали, идет проверка перенаправления через содержимое поля ForvardedTo и если оно заполнено, сравнивается перенаправленная запись.
+
+И вот если сейчас запустить код демонстрационного примера на Windows XP или Vista то все отработает штатно. Он не выведет никаких ошибок, просто покажет список загруженных библиотек и остановится, но... ситуация кардинально поменяется как только он будет запущен на Windows 7 и выше.
+
+..\17.png
+
+Множеству записей в импорте анализатор не смог подобрать соответствующую запись в экспорте, о чем говорит текст "Export record missing".
+Причем практически все эти записи ведут на отсутствующие на жестком диске библиотеки "api-ms-win-xxx.dll" или "ext-ms-win-xxx.dll"
+И такое происходит как у записей в таблицах импорта, так и в таблицах экспорта, обратите внимание на самую последнюю строчку:
+
+Import modified imm32.dll -> kernel32.GetProcessMitigationPolicy, at address: 7641D0D4
+Export record missing, present: 0000000075DECF40, forvarded to "api-ms-win-core-processthreads-l1-1-1.GetProcessMitigationPolicy" --> KernelBase.dll
+
+Сам импорт обработан правильно и запись ведет на kernel32.GetProcessMitigationPolicy, но сама эта функция перенаправлена и ведет на отсутствующую в текущем списке экспорта библиотеку "api-ms-win-core-processthreads-l1-1-1.dll", причем по факту текущий адрес в таблице импорта ведет внутрь "KernelBase.dll".
+
+Сейчас будем с этим разбираться.

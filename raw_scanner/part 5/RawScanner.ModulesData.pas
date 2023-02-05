@@ -12,6 +12,16 @@ uses
   RawScanner.Utils;
 
 type
+  // Информация о записи в таблице импорта полученая из RAW модуля
+  TImportChunk = record
+    OrigLibraryName,
+    LibraryName,
+    FuncName: string;
+    Ordinal: Word;
+    ImportTableVA: ULONG_PTR64;       // VA адрес где должна находиться правильная запись
+    function ToString: string;
+  end;
+
   // Информация об экспортируемой функции полученая из RAW модуля
   TExportChunk = record
     FuncName: string;
@@ -55,6 +65,9 @@ type
     FImagePath: string;
     FImage64: Boolean;
     FImageName, FOriginalName: string;
+    FImport: TList<TImportChunk>;
+    FImportDir: TDirectoryData;
+    FImportAddressTable: TDirectoryData;
     FEntryPoint: ULONG_PTR64;
     FEntryPoints: TList<TEntryPointChunk>;
     FExport: TList<TExportChunk>;
@@ -76,9 +89,13 @@ type
     procedure LoadFromImage;
     function LoadNtHeader(Raw: TStream): Boolean;
     function LoadSections(Raw: TStream): Boolean;
+    function LoadCor20Header(Raw: TStream): Boolean;
     function LoadExport(Raw: TStream): Boolean;
+    function LoadImport(Raw: TStream): Boolean;
     procedure ProcessApiSetRedirect(const LibName: string;
-      var ExportChunk: TExportChunk);
+      var ImportChunk: TImportChunk); overload;
+    procedure ProcessApiSetRedirect(const LibName: string;
+      var ExportChunk: TExportChunk); overload;
     function RvaToRaw(RvaAddr: DWORD): DWORD;
     function RvaToVa(RvaAddr: DWORD): ULONG_PTR64;
     function VaToRaw(VaAddr: ULONG_PTR64): DWORD;
@@ -99,6 +116,9 @@ type
     property ImageBase: ULONG_PTR64 read FImageBase;
     property ImageName: string read FImageName;
     property ImagePath: string read FImagePath;
+    property ImportList: TList<TImportChunk> read FImport;
+    property ImportAddressTable: TDirectoryData read FImportAddressTable;
+    property ImportDirectory: TDirectoryData read FImportDir;
     property ModuleIndex: Integer read FIndex;
     property NtHeader: TImageNtHeaders64 read FNtHeader;
     property OriginalName: string read FOriginalName;
@@ -171,6 +191,19 @@ begin
   FuncName := Copy(Value, Index + 1, Length(Value));
 end;
 
+{ TImportChunk }
+
+function TImportChunk.ToString: string;
+begin
+  Result := ChangeFileExt(LibraryName.ToLower, '.');
+  if FuncName = EmptyStr then
+    Result := Result + IntToStr(Ordinal)
+  else
+    Result := Result + UnDecorateSymbolName(FuncName);
+  if OrigLibraryName <> EmptyStr then
+    Result := OrigLibraryName + Arrow + Result;
+end;
+
 { TExportChunk }
 
 function TExportChunk.ToString: string;
@@ -208,6 +241,7 @@ begin
   FImagePath := ImagePath;
   FImageBase := ImageBase;
   FImageName := ExtractFileName(ImagePath);
+  FImport := TList<TImportChunk>.Create;
   FExport := TList<TExportChunk>.Create;
   FExportIndex := TDictionary<string, Integer>.Create;
   FExportOrdinalIndex := TDictionary<Word, Integer>.Create;
@@ -220,6 +254,7 @@ begin
   FEntryPoints.Free;
   FExportIndex.Free;
   FExportOrdinalIndex.Free;
+  FImport.Free;
   FExport.Free;
   inherited;
 end;
@@ -300,6 +335,18 @@ end;
 
 procedure TRawPEImage.InitDirectories;
 begin
+  with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT] do
+  begin
+    FImportAddressTable.VirtualAddress := RvaToVa(VirtualAddress);
+    FImportAddressTable.Size := Size;
+  end;
+
+  with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] do
+  begin
+    FImportDir.VirtualAddress := RvaToVa(VirtualAddress);
+    FImportDir.Size := Size;
+  end;
+
   with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] do
   begin
     FExportDir.VirtualAddress := RvaToVa(VirtualAddress);
@@ -312,6 +359,55 @@ begin
   // перенаправленые функции в качестве адреса содержат указатель на
   // строку перенаправления обычно размещенную в директории экспорта
   Result := DirectoryIndexFromRva(RvaAddr) = IMAGE_DIRECTORY_ENTRY_EXPORT;
+end;
+
+function TRawPEImage.LoadCor20Header(Raw: TStream): Boolean;
+const
+  // Version flags for image.
+  COR_VERSION_MAJOR_V2 = 2;
+  // Header entry point flags.
+  COMIMAGE_FLAGS_ILONLY = 1;
+  COMIMAGE_FLAGS_32BITREQUIRED = 2;
+type
+  // COM+ 2.0 header structure.
+  PIMAGE_COR20_HEADER = ^IMAGE_COR20_HEADER;
+  IMAGE_COR20_HEADER = record
+    // Header versioning
+    cb: DWORD;
+    MajorRuntimeVersion: Word;
+    MinorRuntimeVersion: Word;
+
+    // Symbol table and startup information
+    MetaData: IMAGE_DATA_DIRECTORY;
+    Flags: DWORD;
+    EntryPointToken: DWORD;
+
+    // Binding information
+    Resources: IMAGE_DATA_DIRECTORY;
+    StrongNameSignature: IMAGE_DATA_DIRECTORY;
+
+    // Regular fixup and binding information
+    CodeManagerTable: IMAGE_DATA_DIRECTORY;
+    VTableFixups: IMAGE_DATA_DIRECTORY;
+    ExportAddressTableJumps: IMAGE_DATA_DIRECTORY;
+
+    // Precompiled image info (internal use only - set to zero)
+    ManagedNativeHeader: IMAGE_DATA_DIRECTORY;
+  end;
+var
+  ComHeader: IMAGE_COR20_HEADER;
+begin
+  Result := False;
+  with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR] do
+  begin
+    if VirtualAddress = 0 then Exit;
+    if Size = 0 then Exit;
+    Raw.Position := RvaToRaw(VirtualAddress);
+  end;
+  if Raw.Position = 0 then Exit;
+  Raw.ReadBuffer(ComHeader, SizeOf(IMAGE_COR20_HEADER));
+  if ComHeader.cb = SizeOf(IMAGE_COR20_HEADER) then
+    FILOnly := ComHeader.Flags and (COMIMAGE_FLAGS_ILONLY or COMIMAGE_FLAGS_32BITREQUIRED) <> 0;
 end;
 
 function TRawPEImage.LoadExport(Raw: TStream): Boolean;
@@ -504,7 +600,7 @@ begin
       Exit;
     Raw.Position := IDH._lfanew;
 
-    // загрузка NT заголовка, всегда ввиде 64 битной структуры
+    // загрузка NT заголовка, всегда в виде 64 битной структуры
     // даже если библиотека 32 бита
     if not LoadNtHeader(Raw) then Exit;
 
@@ -521,15 +617,114 @@ begin
       FEntryPoints.Add(Chunk);
     end;
 
-    // инициализируем адрес и параметры таблицы экспорта
+    // читаем COM+ заголовок (если есть)
+    LoadCor20Header(Raw);
+
+    // в принципе, если файл не исполняемый COM+, уже тут можно выходить
+    // но для проверки, оставим инициализацию всех данных.
+
+    // инициализируем адреса таблиц импорта и экспорта
+    // они пригодятся снаружи для ускорения проверки этих таблиц
     InitDirectories;
 
     // читаем директорию экспорта
     LoadExport(Raw);
 
+    // читаем дескрипторы импорта
+    LoadImport(Raw);
+
   finally
     Raw.Free;
   end;
+end;
+
+function TRawPEImage.LoadImport(Raw: TStream): Boolean;
+var
+  ImageImportDescriptor: TImageImportDescriptor;
+  NextDescriptorRawAddr, LastOffset: Int64;
+  IatData, OrdinalFlag, OriginalFirstThunk: UInt64;
+  IatDataSize: Integer;
+  ImportChunk: TImportChunk;
+begin
+  Result := False;
+  Raw.Position := VaToRaw(FImportDir.VirtualAddress);
+  if Raw.Position = 0 then Exit;
+
+  ZeroMemory(@ImportChunk, SizeOf(TImportChunk));
+  while (Raw.Read(ImageImportDescriptor, SizeOf(TImageImportDescriptor)) =
+    SizeOf(TImageImportDescriptor)) and (ImageImportDescriptor.OriginalFirstThunk <> 0) do
+  begin
+
+    // запоминаем адрес следующего дексриптора
+    NextDescriptorRawAddr := Raw.Position;
+
+    // вычитываем имя библиотеки импорт из которой описывает дескриптор
+    Raw.Position := RvaToRaw(ImageImportDescriptor.Name);
+    if Raw.Position = 0 then
+      Exit;
+
+    // контроль перенаправления через ApiSet
+    ImportChunk.OrigLibraryName := ReadString(Raw);
+    ProcessApiSetRedirect(ImageName, ImportChunk);
+
+    // инициализируем размер записей и флаги
+    IatDataSize := IfThen(Image64, 8, 4);
+    OrdinalFlag := IfThen(Image64, IMAGE_ORDINAL_FLAG64, IMAGE_ORDINAL_FLAG32);
+
+    // вычитываем все записи описываемые дескриптором, пока не кончатся
+    IatData := 0;
+    // сразу запоминаем адрес таблицы в которой будут располазаться адреса
+    // заполняемые лоадером при загрузке модуля в память процесса
+    ImportChunk.ImportTableVA := RvaToVa(ImageImportDescriptor.FirstThunk);
+    // но вычитывать будем из таблицы через OriginalFirstThunk
+    // т.к. FirstThunk в Raw файле может содержать привязаные данные (реальные адреса)
+    // которые для 64 бит мало того, что могут быть далеко за пределами DWORD
+    // так еще и не подойдут для RvaToRaw
+    // пример такой ситуации "ntoskrnl.exe"
+    OriginalFirstThunk := RvaToVa(ImageImportDescriptor.OriginalFirstThunk);
+    // правда OriginalFirstThunk может и не быть в некоторых случаях
+    // в таком случае чтение будет идти из FirstThunk
+    if OriginalFirstThunk = 0 then
+      OriginalFirstThunk := ImportChunk.ImportTableVA;
+    repeat
+
+      LastOffset := VaToRaw(OriginalFirstThunk);
+      if LastOffset = 0 then
+        Exit;
+
+      Raw.Position := LastOffset;
+      Raw.ReadBuffer(IatData, IatDataSize);
+
+      if IatData <> 0 then
+      begin
+        // проверка - идет импорт только по ORDINAL или есть имя функции?
+        if IatData and OrdinalFlag = 0 then
+        begin
+          // имя есть - нужно его вытащить
+          Raw.Position := RvaToRaw(IatData);
+          if Raw.Position = 0 then
+            Exit;
+          Raw.ReadBuffer(ImportChunk.Ordinal, SizeOf(Word));
+          ImportChunk.FuncName := ReadString(Raw);
+        end
+        else
+        begin
+          // имени нет - запоминаем только ordinal функции
+          ImportChunk.FuncName := EmptyStr;
+          ImportChunk.Ordinal := IatData and not OrdinalFlag;
+        end;
+
+        FImport.Add(ImportChunk);
+        Inc(ImportChunk.ImportTableVA, IatDataSize);
+        Inc(OriginalFirstThunk, IatDataSize);
+      end;
+    until IatData = 0;
+
+    // переходим к следующему дескриптору
+    Raw.Position := NextDescriptorRawAddr;
+  end;
+
+  Result := ImageImportDescriptor.OriginalFirstThunk = 0;
 end;
 
 function TRawPEImage.LoadNtHeader(Raw: TStream): Boolean;
@@ -593,6 +788,14 @@ begin
     FVirtualSizeOfImage := Max(FVirtualSizeOfImage,
       FSections[I].VirtualAddress + FSections[I].Misc.VirtualSize);
   end;
+end;
+
+procedure TRawPEImage.ProcessApiSetRedirect(const LibName: string;
+  var ImportChunk: TImportChunk);
+begin
+  // это пока заглушка, её будем расширять далее
+  ImportChunk.LibraryName := ImportChunk.OrigLibraryName;
+  ImportChunk.OrigLibraryName := EmptyStr;
 end;
 
 procedure TRawPEImage.ProcessApiSetRedirect(const LibName: string;
