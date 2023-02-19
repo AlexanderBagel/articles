@@ -1,0 +1,264 @@
+7. Отложенный импорт
+
+Как мне кажется с отложенным импортом разработчики PE формата перемудрили, он избыточен, ведь есть обычная динамическая загрузка библиотек в которой можно удобно принять решение что нужно делать в случае если требуемая функция (или вообще библиотека целиком) отсутствует. Этот гибкий механизм зачем то преобразовали в гораздо менее удобный механизм отложенного импорта. Его суть заключается в следующем - в PE файле в отдельной директории строится таблица отложенного импорта, в которую помещаются данные об импортируемых функциях "предположительно отсутствующих" на операционной системе пользователя и эта таблица не обрабатывается загрузчиком, что позволяет программе запуститься без выдачи сообщения "The procedure entry point {%FuncName%} could not be located in the dynamic link library {%LibName%}".
+Изначальные адреса таких функций указывают на код их инициализации, который должен выполнится при первом вызове такой функции.
+Причем в Microsoft Visual Studio это все документировано и код такого обработчика доступен как для изучения, так и для модификации под свои требования, подробнее можно узнать в MSDN {ref https://learn.microsoft.com/en-us/cpp/build/reference/understanding-the-helper-function}.
+А вот в Delphi с этим все сложнее, заменить его на свой и вообще посмотреть как он работает увы не удастся, т.к. он реализован в отсутствующем delayhlp.cpp (название модуля подозрительно похоже на такой-же аналог у MSVC).
+Если огрубить, то задача такого обработчика заключается в вызове GetModuleHandle/LoadLibrary + GetProcAddress после чего полученный адрес функции размещается в нужном поле таблицы отложенного экспорта, заменяя текущий, указывающий на код инициализации.
+Соответственно если первый раз вызов произошел успешно и адрес функции определился правильно, то повторный вызов функции импортирующейся через отложенную таблицу импорта будет идти уже напрямую, минуя код инициализации. 
+В контексте статьи именно это поле в таблице и будет интересно, причем надо сразу закладываться что правильных значений в этом поле может быть два: адрес кода инициализации и адрес реальной функции.
+
+Расположена отложенная таблица импорта в директории IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT и представляет из себя массив дескрипторов:
+
+  TImgDelayDescr = record
+    grAttrs,                // attributes
+    rvaDLLName,             // RVA to dll name
+    rvaHmod,                // RVA of module handle
+    rvaIAT,                 // RVA of the IAT
+    rvaINT,                 // RVA of the INT
+    rvaBoundIAT,            // RVA of the optional bound IAT
+    rvaUnloadIAT,           // RVA of optional copy of original IAT
+    dwTimeStamp: DWORD;     // 0 if not bound,
+                            // O.W. date/time stamp of DLL bound to (Old BIND)
+  end;
+  
+- Поле grAttrs, содержит флаг типа адресации полей дескриптора.
+Адреса содержащиеся в этой структуре могут быть представлены в двух видах:
+1. В виде RVA, при этом поле grAttrs будет равно dlattrRva (равное единице).
+2. В виде VA указателя (поле grAttrs будет равно нулю), причем эта привязка будет идти относительно ImageBase указанного в PE заголовке, и если загрузка произошла по другому адресу, данное значение нужно будет пересчитать относительно текущей базы.
+Т.е. потребуется вот такая утилитарная функция:
+
+  function GetRva(Value: ULONG_PTR64): ULONG_PTR64;
+  const
+    dlattrRva = 1;
+  begin
+    if DelayDescr.grAttrs = dlattrRva then
+      Result := Value
+    else
+      Result := Value - NtHeader.OptionalHeader.ImageBase;
+  end;
+  
+Судя по комментариям в MSDN, RVA адресация началась с VC 7.0, раньше писали как есть в виде прямых VA указателей. Ну а в Delphi сразу формируют в RVA адресации сразу как только она появилась.
+
+- Поле rvaDLLName, отвечает за имя библиотеки из которой будет производится импорт.
+- Поле rvaHmod - содержит указатель на поле содержащее hInstance этой библиотеки и используется в коде инициализации при проверке, загружена ли уже такая библиотека или нет. Если библиотека была загружена и позже выгружена, поле обнуляется. Можно было бы использовать в коде анализатора для проверки инициализации дескриптора, но есть нюанс, а именно - если код инициализации получил инстанс библиотеки через GetModuleHandle и не производил реальную загрузку библиотеки, это поле останется равным нулю.
+- Поле rvaIAT, указатель на начало массива адресов импортируемых функций. Именно этот массив будет контролироваться анализатором. Размер массива и порядок элементов полностью соответствует аналогичному массиву из поля rvaINT.
+- Поле rvaINT, указатель на начало массива имен импортируемых функций. Именно по этому массиву определяется количество импортируемых функций, т.к. он, в отличие от rvaIAT всегда заканчивается пустым элементом равным нулю. Так-же как и в обычном импорте вместо имени функции в этом массиве может лежать Ordinal функции вместо имени, для определения которого используются те-же маски IMAGE_ORDINAL_FLAG64 и IMAGE_ORDINAL_FLAG32.
+- Поле rvaBoundIAT, теоретически должно использоваться для настройки массива rvaIAT через связанный импорт, но на практике мне такое не встречалось и буфер, на который указывает данное поле всегда был пуст.
+- rvaUnloadIAT, содержит указатель на динамически формируемый массив отвечающий за восстановление полей массива rvaINT при выгрузке библиотеки из которой происходил импорт функций. Т.е. если из этой библиотеки были проинициализированы только две фунции из десяти импортируемых, будет содержать ровно два элемента указывающих на код, отвечающий за сброс полей rvaINT каждой из функций обратно на код их инициализации.
+- dwTimeStamp, поле относится к связанному импорту (rvaBoundIAT) и не интересно.
+
+Вот так будет выглядеть таблица отложенного импорта у текущего демопримера:
+
+..\19.png
+
+Наглядно видно что массивы rvaIAT от всех трех дескрипторов объединены в один сплошной (левая стрелка DIAT), поэтому размерность каждого из массивов устанавливается по rvaINT (правая стрелка DINT). Ну а то что на kernel32.dll ссылаются два дескриптора, это уже особенности как обычного импорта, так и отложенного импорта, такой вот нюанс.
+
+Для чтения директории отложеного импорта первоначально необходимо получить её адрес:
+
+  with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT] do
+  begin
+    FDelayDir.VirtualAddress := RvaToVa(VirtualAddress);
+    FDelayDir.Size := Size;
+  end;
+  
+После чего можно писать код чтения:
+
+function TRawPEImage.LoadDelayImport(Raw: TStream): Boolean;
+...
+begin
+  Result := False;
+  Raw.Position := VaToRaw(DelayImportDirectory.VirtualAddress);
+  if Raw.Position = 0 then Exit;
+
+  IntData := 0;
+  DataSize := IfThen(Image64, 8, 4);
+  ZeroMemory(@ImportChunk, SizeOf(TImportChunk));
+  ImportChunk.Delayed := True;
+  OrdinalFlag := IfThen(Image64, IMAGE_ORDINAL_FLAG64, IMAGE_ORDINAL_FLAG32);
+
+  Raw.ReadBuffer(DelayDescr, SizeOf(TImgDelayDescr));
+  while DelayDescr.rvaIAT <> 0 do
+  begin
+    NextDescriptorRawAddr := Raw.Position;
+
+    Raw.Position := RvaToRaw(GetRva(DelayDescr.rvaDLLName));
+    if Raw.Position = 0 then Exit;
+    
+    ImportChunk.OrigLibraryName := ReadString(Raw);
+    ProcessApiSetRedirect(ImageName, ImportChunk);
+
+    IAT := GetRva(DelayDescr.rvaIAT);
+    INT := GetRva(DelayDescr.rvaINT);
+    repeat
+      LastOffset := RvaToRaw(INT);
+      if LastOffset = 0 then Exit;
+      Raw.Position := LastOffset;
+      Raw.ReadBuffer(IntData, DataSize);
+	  
+      if IntData <> 0 then
+      begin
+        if IntData and OrdinalFlag = 0 then
+        begin
+          Raw.Position := RvaToRaw(GetRva(IntData));
+          if Raw.Position = 0 then Exit;
+          Raw.ReadBuffer(ImportChunk.Ordinal, SizeOf(Word));
+          ImportChunk.FuncName := ReadString(Raw);
+        end
+        else
+        begin
+          ImportChunk.FuncName := EmptyStr;
+          ImportChunk.Ordinal := IntData and not OrdinalFlag;
+        end;
+        ImportChunk.ImportTableVA := RvaToVa(IAT);
+		
+        Raw.Position := VaToRaw(ImportChunk.ImportTableVA);
+        if Raw.Position = 0 then Exit;
+        Raw.ReadBuffer(ImportChunk.DelayedIATData, DataSize);
+		  
+        FImport.Add(ImportChunk);
+        Inc(IAT, DataSize);
+        Inc(INT, DataSize);
+      end;
+    until IntData = 0; 
+	
+    Raw.Position := NextDescriptorRawAddr;
+    Raw.ReadBuffer(DelayDescr, SizeOf(TImgDelayDescr));
+  end;
+end;
+
+Так-же как и в обычном импорте происходит первичная настройка размеров адресов и флагов для детектирования Ordinal значений функций, после чего идет последовательное чтение дескрипторов и обязательный контроль редиректа на виртуальные библиотеки, посредством вызова ProcessApiSetRedirect. У каждого дескриптора зачитывается массив rvaINT по которому контролируется размер массива rvaIAT (напоминаю - они синхронизированы).
+
+Теперь нужно подключить вызов этой функции в TRawPEImage.LoadFromImage и внести изменения в код анализатора.
+
+  function CheckRemoteVA: Boolean;
+  begin
+    if Import.Delayed then
+    begin
+      if HookData.Calculated then
+        Result :=
+          (HookData.RemoteVA = Import.DelayedIATData) or
+          (HookData.RemoteVA = HookData.RawVA)
+      else
+        Result := HookData.RemoteVA = Import.DelayedIATData;
+    end
+    else
+      Result := HookData.Calculated and
+        (HookData.RemoteVA = HookData.RawVA);
+  end;
+  
+...
+
+      HookData.RemoteVA := 0;
+      if Import.Delayed then
+        HookData.RawVA := Import.DelayedIATData
+      else
+        HookData.RawVA := 0;
+
+Основные изменения произошли в CheckRemoteVA в которой обрабатывается ситуация что каждое поле в таблице может содержать одно из двух значений, либо указатель на код инициализации (в таком случае это значение будет равно Import.DelayedIATData) либо указатель на реальную функцию (HookData.RawVA если таковая будет найдена среди загруженных библиотек).
+
+Если прямо сейчас запустить демо-пример то результат слегка удивит:
+
+..\20.png
+
+На экране будут записи о том что практически каждая импортированная через отложенный импорт функция перехвачена.
+Можете сами попробовать раскоментировав директиву IGNORE_RELOCATIONS в начале модуля RawScanner.ModulesData.
+Если проверить содержимое таких полей в памяти процесса на соответствие тем числам который записаны в теле библиотек то действительно будут расхождения:
+
+..\21.png
+
+А расхождения будут по причине того что изначальные адреса в массиве rvaIAT которые указывают на код инициализации каждой импортируемой функции записаны в VA адресации, т.е. с учетом базы модуля. На скриншоте это наглядно видно, в памяти библиотека расположена по адресу 0х762D0000, но в PE заголовке её база указана как 0х6B800000 отсюда и разница в значениях, на которой у анализатора идет промах.
+
+Выйти из этой ситуации можно двумя способами, не правильным, пересчитав адреса руками из старой ImageBase в новую, и правильным - подключив обработку таблицы релокаций, расположенной в отдельной директории IMAGE_DIRECTORY_ENTRY_BASERELOC.
+
+Как она работает: в коде приложения есть предостаточно мест где встречается прямая VA адресация, причем встречается прямо в коде тела приложения, где налету уже не пересчитать разность баз загрузки, вот тут и выручает таблица релокаций, которую загрузчик обрабатывает при старте.
+Грубо все адресное пространство процесса разделено на страницы размером в 4096 байт (диапазон адресов в рамках страницы 0..0xFFF), а таблица релокаций содержит в себе информацию о всех таких страницам и смещениям в них (в этом-же диапазоне) по которым будут расположены базозависимые адреса.
+
+Выглядит это следующим образом, в директории IMAGE_DIRECTORY_ENTRY_BASERELOC идет массив структур:
+
+  TImageBaseRelocation = record
+    VirtualAddress: DWORD;
+    SizeOfBlock: DWORD;
+  end;
+  
+Поле VirtualAddress, содержит RVA адрес, который указывает на конкретную страницу содержащую адреса требующие коррекции базы.
+Поле SizeOfBlock содержит общий размер (в байтах) всех смещений в рамках страницы плюс размер самого заголовка. Т.е. грубо если на странице встречаются шесть адресов которым требуется пересчет, SizeOfBlock = Count * SizeOf(Word) + SizeOf(TImageBaseRelocation) = 20 байт.
+Сами блоки представляют из себя двухбайтовое значение в котором старшие 4 бита являются флагом определяющим тип блока, а оставшиеся 12 бит непосредственно оффсетом в диапазоне 0..0хFFF.
+
+Типов блоков много, но реально в РЕ файле будет всего три:
+
+const
+  IMAGE_REL_BASED_ABSOLUTE = 0;
+  IMAGE_REL_BASED_HIGHLOW = 3;
+  IMAGE_REL_BASED_DIR64 = 10;
+
+Первый используется для выравнивания и не содержит никакой полезной информации, а остальные два применяются в 32 битных и 64 битных образах, указывая на то, что в младших 12 битах содержится оффсет.
+
+Код читающий таблицу релокаций достаточно тривиален:
+
+function TRawPEImage.LoadRelocations(Raw: TStream): Boolean;
+...
+begin
+  FRelocationDelta := ImageBase - FNtHeader.OptionalHeader.ImageBase;
+  if not Image64 then
+    FRelocationDelta := DWORD(FRelocationDelta);
+  Result := FRelocationDelta = 0;
+  if Result then Exit;
+  Reloc := FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+  if (Reloc.VirtualAddress = 0) or (Reloc.Size = 0) then Exit;
+  Raw.Position := RvaToRaw(Reloc.VirtualAddress);
+  if Raw.Position = 0 then Exit;
+  MaxPos := Raw.Position + Reloc.Size;
+  while Raw.Position < MaxPos do
+  begin
+    Raw.ReadBuffer(ImageBaseRelocation, SizeOf(TImageBaseRelocation));
+    Dec(ImageBaseRelocation.SizeOfBlock, SizeOf(TImageBaseRelocation));
+    for I := 0 to Integer(ImageBaseRelocation.SizeOfBlock shr 1) - 1 do
+    begin
+      Raw.ReadBuffer(RelocationBlock, SizeOf(Word));
+      case RelocationBlock shr 12 of
+        IMAGE_REL_BASED_HIGHLOW,
+        IMAGE_REL_BASED_DIR64:
+          FRelocations.Add(Pointer(RvaToRaw(ImageBaseRelocation.VirtualAddress + RelocationBlock and $FFF)));
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+Самой первой строкой рассчитывается дельта, означающая разницу между текущей базой загрузки и изначально указанной в РЕ заголовке.
+Если разница отсутствует (равна нулю), т.е образ был загружен по тому адресу, какой указал разработчик при компиляции, то смысла грузить таблицу релокаций нет, т.к. все базозависимые адреса содержат актуальные значения.
+Ну а дальше последовательно читаются все записи по каждой странице, на основе размера указанного в заголовке каждой TImageBaseRelocation.
+Реальный адрес, который требует перерасчета, равен RVA адресу страницы + оффсету, указаному в блоке.
+Информация по каждой отдельной странице идет сразу же за окончанием данных по предыдущей, для выравнивания используются блоки IMAGE_REL_BASED_ABSOLUTE.
+
+После того как таблица релокаций прочитана, её необходимо применить к текущему образу файла считанного с диска:
+
+procedure TRawPEImage.ProcessRelocations(AStream: TStream);
+...
+begin
+  if FRelocationDelta = 0 then Exit;
+  Reloc := 0;
+  AddrSize := IfThen(Image64, 8, 4);
+  for var RawReloc in FRelocations do
+  begin
+    AStream.Position := Int64(RawReloc);
+    AStream.ReadBuffer(Reloc, AddrSize);
+    Inc(Reloc, FRelocationDelta);
+    AStream.Position := Int64(RawReloc);
+    AStream.WriteBuffer(Reloc, AddrSize);
+  end;
+end;
+
+Код вообще тривиальный, просто бежим по рассчитанным при чтении таблицы релокаций адресам и прибавляем к каждому дельту.
+И теперь если добавить перед загрузкой таблицы отложенного импорта следующий код, то демопример заработает так как нужно:
+
+procedure TRawPEImage.LoadFromImage;
+...
+begin
+    if LoadRelocations(Raw) then
+      ProcessRelocations(Raw);  
+    
+    LoadDelayImport(Raw);
+...
+end;
