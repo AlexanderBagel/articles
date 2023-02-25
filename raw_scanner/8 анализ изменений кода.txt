@@ -1,0 +1,291 @@
+8. Определение адресов TLS коллбэков и детектирование модификации кода.
+
+На текущем этапе анализатору доступна практически вся необходимая информация об удаленном процессе, за исключением адресов TLS калбэков, которые выполняются ДО точки входа каждого модуля.
+Про них я уже писал ранее {ref} поэтому останавливаться на разъяснениях не буду, сразу покажу код для получения их адресов.
+
+Адреса калбэков расположены в виде массива, на начало которого указывает структура _IMAGE_TLS_DIRECTORY32/64, а если точнее её поле AddressOfCallBacks. Данная структура расположена в директории IMAGE_DIRECTORY_ENTRY_TLS, поэтому первым шагом надо получить её адрес:
+
+  with FNtHeader.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] do
+  begin
+    FTlsDir.VirtualAddress := RvaToVa(VirtualAddress);
+    FTlsDir.Size := Size;
+  end;
+
+Сама структура выглядит следующим образом (на примере 64 битной её версии):
+
+  _IMAGE_TLS_DIRECTORY64 = record
+    StartAddressOfRawData: ULONGLONG;
+    EndAddressOfRawData: ULONGLONG;
+    AddressOfIndex: ULONGLONG;         // PDWORD
+    AddressOfCallBacks: ULONGLONG;     // PIMAGE_TLS_CALLBACK *;
+    SizeOfZeroFill: DWORD;
+    Characteristics: DWORD;
+  end;
+
+Первые четыре поля в действительности являются указателями, поэтому размер в зависимости от битности образа исполняемого файла меняется (4 и 8 байт).
+Адреса содержащиеся в данных полях идут в VA адресации и загрузчик при старте приложения (точнее при загрузке модуля) производит их актуализацию посредством секции релоков.
+Поля StartAddressOfRawData, EndAddressOfRawData и SizeOfZeroFill отвечают за размеры шаблона TLS, это грубо говоря блок данных который копируется в TLS секцию каждого потока структуры TEB (Thread Environment Block) при старте потока.
+Чтобы было понятней - при помощи этого механизма работают такие вещи как threadvar, т.е. переменные которые содержат данные принадлежащие только текущему потоку.
+AddressOfIndex и Characteristics - тоже относятся к этому механизму и не интересны, все что нужно получить из этой структуры, это значение поля AddressOfCallBacks.
+Он указываем на массив VA адресов заканчивающийся нулем.
+
+В памяти процесса это выглядит вот таким образом:
+
+..\22.png
+
+Сам код загрузки TLS калбэков:
+
+function TRawPEImage.LoadTLS(Raw: TStream): Boolean;
+
+  function TlsVaToRva(Value: ULONG_PTR64): DWORD;
+  begin
+    Result := Value - NtHeader.OptionalHeader.ImageBase
+  end;
+
+begin
+  Result := False;
+  Raw.Position := VaToRaw(TlsDirectory.VirtualAddress);
+  if Raw.Position = 0 then Exit;
+  AddrSize := IfThen(Image64, 8, 4);
+  // пропускаем 3 поля IMAGE_TLS_DIRECTORYхх:
+  // StartAddressOfRawData + EndAddressOfRawData + AddressOfIndex
+  // становясь, таким образом, сразу на позиции AddressOfCallBacks
+  Raw.Position := Raw.Position + AddrSize * 3;
+  Counter := 0;
+  TlsCallbackRva := 0;
+  // зачитываем значение AddressOfCallBacks
+  Raw.ReadBuffer(TlsCallbackRva, AddrSize);
+  // если цепочка колбэков не назначена - выходим
+  if TlsCallbackRva = 0 then Exit;
+  // позиционируемся на начало цепочки калбэков
+  Raw.Position := RvaToRaw(TlsVaToRva(TlsCallbackRva));
+  if Raw.Position = 0 then Exit;
+  repeat
+    Raw.ReadBuffer(TlsCallbackRva, AddrSize);
+    if TlsCallbackRva <> 0 then
+    begin
+      Chunk.EntryPointName := 'Tls Callback ' + IntToStr(Counter);
+      Chunk.AddrVA := RvaToVa(TlsVaToRva(TlsCallbackRva));
+      Chunk.AddrRaw := VaToRaw(Chunk.AddrVA);
+      FEntryPoints.Add(Chunk);
+      Inc(Counter);
+    end;
+  until TlsCallbackRva = 0;
+end;
+
+Он очень простой, читается поле IMAGE_TLS_DIRECTORYхх.AddressOfCallBacks и если оно не равно нулю, то вычитываются все адреса, пока не дойдем до нулевого.
+
+Теперь, не смотря на то что все необходимые анализатору адреса получены, нужно выполнить некоторые подготовительные действия.
+Во первых - часть функций не являются исполняемыми, например экспортируемые NTDLL.DLL функции NlsMbCodePageTag и NlsMbOemCodePageTag в действительности являются указателями на таблицы кодовых страниц, которые сформирует загрузчик и в образе данной библиотеки вообще указывают в пустоту между секциями .data и .pdata, а это приводит к тому что невозможно узнать их RAW адрес, т.к. он по факту отсутствует, ибо RVA не принадлежит ни одной из секций.
+Ну или функция RtlNtdllName, которая является указателем на строку "ntdll.dll".
+
+Такие функции нужно отметить как "не исполняемые", чтобы анализатор пропускал их при проверке, иначе будет FalsePositive реакция.
+
+function TRawPEImage.IsExecutable(RvaAddr: DWORD): Boolean;
+const
+  ExecutableCode = IMAGE_SCN_CNT_CODE or IMAGE_SCN_MEM_EXECUTE;
+...
+begin
+  Result := GetSectionData(RvaAddr, SectionData);
+  if Result then
+  begin
+    PointerToRawData := FSections[SectionData.Index].PointerToRawData;
+    if FNtHeader.OptionalHeader.SectionAlignment >= DEFAULT_SECTION_ALIGNMENT then
+      PointerToRawData := AlignDown(PointerToRawData, DEFAULT_FILE_ALIGNMENT);
+    Inc(PointerToRawData, RvaAddr - SectionData.StartRVA);
+    Result :=
+      (PointerToRawData < FSizeOfFileImage) and
+      (FSections[SectionData.Index].Characteristics and ExecutableCode = ExecutableCode);
+  end;
+end;
+
+Задача этой функции проверить, принадлежит ли переданный адрес какой либо секции, и если принадлежит, то уточнить - выставлены ли у секции флаги наличия кода и разрешения на исполнение.
+Каждая функция полученная через таблицу экспорта должна быть проверена этим кодом.
+
+Во вторых есть один очень сложный момент, который не получилось у меня "нормально" решить, дело в том что в памяти процесса может быть загружено несколько одинаковых библиотек, но из разных директорий. Особенно это актуально для comctl32.dll.
+К примеру приложение без манифеста загрузит comctl32.dll пятой версии, работает и вдруг в какой-то момент времени загружает еще одну библиотеку, у которой в таблице импорта указана HIMAGELIST_QueryInterface, которая отсутствует в пятой comctl32, но вполне себе присутствует в шестой, и именно шестая версия comctl32.dll и будет загружена в адресное пространство процесса, а весь остальной импорт у этой новой библиотеки будет перенаправлен либо на comctl32.dll от шестой версии, либо пятой, либо вообще в разнобой (и такая ситуация встретилась). Все зависит от конкретной реализации загрузчика в текущей операционной системе.
+Другая ситуация: например я делаю библиотеку A.DLL которая статически слинкована на библиотеку B.DLL через таблицу импорта, после чего, делаю две копии библиотеки B.DLL в разных папках и загружаю их обе через LoadLibrary(), после чего гружу уже A.DLL и тут опять не понятно, в зависимости от ОС адреса импорта в A.DLL будут направлены либо на первую загруженную B.DLL, либо на вторую, причем еще есть нюанс - если одна из B.DLL будет расположена в папке с A.DLL то загрузчик будет линковать импорт уже на неё, причем если она не загружена - то с одновременной загрузкой. 
+А еще же есть Hard-import link, когда у импортируемой функции указывается либо относительный, либо полный путь к библиотеке, такие ситуации загрузчик обрабатывает особым способом.
+
+В итоге я решил не переусложнять код и поступил следующим образом. У класса TRawPEImage ввел поле RelocatedImages: TList<TRawPEImage> а в методе TRawModules.AddImage добавил проверку, если образ с таким именем уже присутствует в списке загруженных, то он добавляется не в общий список, а в список RelocatedImages уже присутствующего модуля. После чего реализовал следующие две функции:
+
+function CheckImageAtAddr(Image: TRawPEImage; CheckAddrVA: ULONG_PTR64): Boolean;
+begin
+  Result := (Image.ImageBase < CheckAddrVA) and
+    (Image.ImageBase + UInt64(Image.VirtualSizeOfImage) > CheckAddrVA);
+end;
+
+function TRawPEImage.GetImageAtAddr(AddrVA: ULONG_PTR64): TRawPEImage;
+begin
+  Result := Self;
+  if (RelocatedImages.Count > 0) and not CheckImageAtAddr(Self, AddrVA) then
+  begin
+    for var Index := 0 to RelocatedImages.Count - 1 do
+      if CheckImageAtAddr(RelocatedImages[Index], AddrVA) then
+      begin
+        Result := RelocatedImages[Index];
+        Break;
+      end;
+  end;
+end;
+
+Первая проверяет, принадлежит ли переданный VA адрес области памяти в которой располагается идущий первым параметром образ РЕ файла.
+Вторая же просто идет по списку альтернативных образов и ищет тот, которому принадлежит адрес, возвращая результатом либо себя, либо перенаправленный РЕ файл.
+Дешево и сердито :)
+
+Третий момент, код проверяемой функции может быть очень маленький, причем сама функция может быть расположена в самой конце секции. Если проверять модификацию тела функций сверкой первых 64 байт, то может произойти ситуация что эти 64 байта захватят данные, которые в физическом образе файла уже принадлежат совершенно другой секции, т.е. когда файл будет загружен, эти данные будут расположены по совершенно другому адресу, не так как в бинарном файле.
+
+  dclIndyProtocols270.bpl export: Finalize
+     Expected: B8 1C 4B 42 23 E8 F2 BB FF FF C3 90 ! FF 25 04 A1 42 23 8B C0...
+     Present:  B8 1C 4B 42 23 E8 F2 BB FF FF C3 90 ! 00 00 00 00 00 00 00 00...
+
+Например вот так выглядит код функции Finalize, строчка Expected указывает на данные, которые были прочитаны из образа файла на диске, а строчка Present на прочитанные из памяти. Восклицательным знаком я отделил данные которые относятся к следующей секции. Если вы разбираетесь в машинных кодах то сразу можете заметить что последние два байта перед восклицательным знаком соответствуют опкодам инструкций RET И NOP, и можно на их основе узнать об окончании тела функции, но дело в том что вместо них там может быть и JMP, а так-же другие варианты передачи управления ранее по коду, да и подключение в код фреймворка собственного дизассемблера я решил избыточным чтобы разбираться с такими ситуациями, поэтому поступил проще, а именно добавил следующую функцию:
+
+function TRawPEImage.FixAddrSize(AddrVA: ULONG_PTR64;
+  var ASize: DWORD): Boolean;
+...
+begin
+  AddrRva := VaToRva(AddrVA);
+  Result := GetSectionData(AddrRva, Data);
+  if Result then
+  begin
+    if Data.StartRVA + Data.Size < AddrRva + ASize then
+      ASize := Data.StartRVA + Data.Size - AddrRva;
+  end;
+end;
+
+Её задача проверять выход VA адреса за диапазон секции, и корректировать переданный размер.
+
+И вот только теперь можно расширить анализатор, добавив в него проверку тела функций на их модификацию:
+
+procedure TPatchAnalyzer.CompareBinary(AddrVa: ULONG_PTR64; AddrRaw: DWORD;
+  const FuncName: string; Module: TRawPEImage);
+const
+  DefaultBuffSize = 64;
+...
+begin
+  Inc(FAnalizeResult.Code.Scanned);
+
+  SetLength(RawBuff, DefaultBuffSize);
+  SetLength(RemoteBuff, DefaultBuffSize);
+
+  BuffSize := DefaultBuffSize;
+  Module.FixAddrSize(AddrVA, BuffSize);
+
+  // зачитываем блок из файла
+  FRaw.Position := AddrRaw;
+  FRaw.ReadBuffer(RawBuff[0], BuffSize);
+
+  // и из памяти
+  if not ReadRemoteMemory(FProcessHandle, AddrVA,
+    @RemoteBuff[0], BuffSize) then
+    Exit;
+
+  if not CompareMem(@RawBuff[0], @RemoteBuff[0], BuffSize) then
+  begin
+
+    Data.Patched :=
+      CheckPageSharing(AddrVA, SharedCount) and
+      (SharedCount = 0);
+
+    // блоки не совпали
+    // отдаем на анализ внешнему обработчику, если таковой назначен
+    if Assigned(FProcessCodeHook) then
+    begin
+      Data.ProcessHandle := FProcessHandle;
+      Data.Image64 := Module.Image64;
+      Data.ImageBase := Module.ImageBase;
+      Data.ExportFunc := ChangeFileExt(Module.ImageName, '.' + FuncName);
+      Data.AddrVA := AddrVA;
+      Data.RawOffset := AddrRaw;
+      Data.Raw := @RawBuff[0];
+      Data.Remote := @RemoteBuff[0];
+      Data.BufSize := BuffSize;
+      FProcessCodeHook(Data);
+    end;
+
+  end;
+end;
+
+Функция очень простая по своей сути, на вход приходит два адреса, AddrVa - адрес функции в адресном пространстве процесса, AddrRaw - оффсет в образе файла на диске. По этим адресам читается 64 байта (или меньше - коррекция размера идет через FixAddrSize) после чего оба блока сравниваются. При расхождении вызывается внешний обработчик, который будет разбираться, что именно с этими буферами не так.
+
+Подключить вызов этой процедуры нужно в двух местах, в сканировании экспорта, добавив в конец следующий кусок кода:
+
+      // 1. Если функция перенаправлена в другой модуль - пропускаем проверку
+      if Exp.OriginalForvardedTo <> EmptyStr then
+      begin
+        Inc(FAnalizeResult.Code.Skipped);
+        Continue;
+      end;
+
+      // 2. Если функция не содержит кода - пропускаем проверку
+      if not Exp.Executable then
+      begin
+        Inc(FAnalizeResult.Code.Skipped);
+        Continue;
+      end;
+
+      // после того как удостоверились что запись в таблице экспорта валидная
+      // и не перенаправлена в другой модуль, то тогда
+      // проверяем бинарный код функции
+      CompareBinary(Exp.FuncAddrVA, Exp.FuncAddrRaw, Exp.ToString, Module);
+
+Этим будет проверятся тело каждой экспортируемой функции каждого известного анализатору модуля.
+А также сделать новый метод, в котором будет производиться сканирование всех EntryPoint и TLS калбэков загруженных модулей:
+
+procedure TPatchAnalyzer.ScanEntryPoints(Index: Integer; Module: TRawPEImage);
+begin
+  for var I := 0 to Module.EntryPointList.Count - 1 do
+    with Module.EntryPointList.List[I] do
+      CompareBinary(AddrVA, AddrRaw, EntryPointName, Module);
+end;
+
+Причем вызываться она будет для всех модулей, которые не являются COM+ (содержащими только IL код)
+
+  if not Module.ComPlusILOnly then
+    ScanEntryPoints(Index, Module);
+
+И в заключение пожалуй стоит рассмотреть код самого калбэка, в котором принимается решение - была ли модификация тела функции или нет.
+Для его работы по хорошему нужен полноценный дизассемблер, но в рамках статьи я посчитал это избыточным (она и так вышла достаточно объемная) поэтому заменил его на простенький дизассемблер длин, взяв первый попавшийся на GIT и портировав его на Delphi. Он такой - неказистый, ошибается на некоторых сложных инструкциях, впрочем его задача попытаться подсказать коду в калбэке где может находится инструкция RET, означающая конец функции и с ней он в 98 процентов случаев справляется успешно.
+Код обработчика (если подсократить проверки) будет следующий:
+
+procedure ProcessCodeHook(const Data: TCodeHookData);
+...
+begin
+  // поиск конца функции
+  rawCursor := Data.Raw;
+  I := Data.BufSize;
+  while I > 0 do
+  begin
+    OpcodeLen := ldisasm(rawCursor, Data.Image64);
+    Dec(I, OpcodeLen);
+    // просто ищем инструкцию RET
+    if (OpcodeLen = 1) and (rawCursor^ = $C3) then
+      Break;
+    Inc(rawCursor, OpcodeLen);
+  end;
+
+  if CompareMem(Data.Raw, Data.Remote, Data.BufSize - I) then
+    Exit;
+
+  Writeln('  Expected: ' + ByteToHexStr(Data.Raw, Data.BufSize - I));
+  Writeln('  Present:  ' + ByteToHexStr(Data.Remote, Data.BufSize - I));
+end;
+
+Задача данного кода распознать конец "коротких" функций (опираясь на дизассемблер длин инструкций) и при нахождении такового выполнить повторную проверку.
+Дело в том что когда идут две три инструкции подряд, из которых изменена только последняя, без такого дополнительного контроля длины функции все три будут выведены как измененные, а здесь идмет подстраховка для такой ситуации.
+И теперь, если запустить демопример на выполнение из под отладчика, он (будучи уже настроенным на сканирование процесса родителя) покажет состояние запущенной Delphi (ну или проводника если запуск будет из под него).
+Правда придется немного подождать - сканирование такого тяжелого процесса как bds.exe, с обильным рантаймом на который нет системного кэша, не сильно быстрое по времени и может занять секунд 20-30.
+
+..\23.png
+
+Что из неё можно получить:
+1. самая первая запись говорит о том что в rtl270.bpl в таблице импорта перехвачена запись ведущая на kernel32.RaiseException и перехватчик ведет куда-то вглубь exceptiondiag270.bpl
+Это работа самой delphi которая при возникновении исключений в DesignTime наконец то начала показывать хоть какой-то более менее читаемый стек, ведущий к ошибке.
+2. далее идут две модифицированных функции из того же rtl270.bpl, это HandleAutoException и RaiseLastOSError. Это постаралась установленная на моей машине EurekaLog установив перехватчик прямо в теле функций, ведущий куда-то вглубь EurekaLogExpert270.bpl На скриншоте конечно этого не видно, т.к. показаны только модифицированные байты начала функций, но если их обработать через дизассемблер, картина станет более понятной.
+3. Ну и наконец кто-то влез в win32debugide270.bpl модифицировав начало функции TNativeDebugger.DoShowException. Это уже установленный у меня GExpert балуется, перенаправляя вызов функции вглубь GExpertsRS104.dll чтобы вместо штатного окошка показывать расширенное с кнопками "игнорировать данный тип исключения" и т.п. - кстати удобная вешь!
+
+Если же подключить полноценный дизассембер, то все перехваты будут выведены в более приемлемом виде:
+
+..\24.png
+

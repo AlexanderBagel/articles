@@ -1,0 +1,52 @@
+9. В качестве заключения
+
+В итоге по шагам, чтобы произвести полноценный анализ изменений данных в стороннем процессе нужно:
+1. уметь читать данные невзирая на битность текущего и удаленного процессов
+2. уметь читать списки загрузчика из удаленного процесса
+3. уметь читать таблицы экспорта/импорта/отложенного импорта а так-же точек входа и TLS калбэков
+4. уметь обрабатывать форвард перенаправления функций и ApiSet редиректы
+
+Если кто-то будет более подробно разбираться с тематикой статьи не забывайте что я специально разбил код на главы и наращивал его от главы к главе (через Merge можно сравнить две папки и увидеть что добавилось/изменилось для каждой главы).
+Вполне вероятно что вам пригодятся следующие ссылки:
+
+По формату исполняемых файлов:
+  https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/inside-windows-an-in-depth-look-into-the-win32-portable-executable-file-format-part-2
+  https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+  https://wasm.in/blogs/ot-zelenogo-k-krasnomu-glava-2-format-ispolnjaemogo-fajla-os-windows-pe32-i-pe64-sposoby-zarazhenija-ispolnjaemyx-fajlov.390/
+
+Дополнительная информация по ApiSet:  
+  https://lucasg.github.io/2017/10/15/Api-set-resolution/
+  https://blog.quarkslab.com/runtime-dll-name-resolution-apisetschema-part-i.html
+  https://blog.quarkslab.com/runtime-dll-name-resolution-apisetschema-part-ii.html
+  https://github.com/lucasg/Dependencies/blob/master/ClrPhlib/include/ApiSet.h
+
+Немного по работе загрузчика:
+  https://learn.microsoft.com/en-us/archive/msdn-magazine/2002/march/windows-2000-loader-what-goes-on-inside-windows-2000-solving-the-mysteries-of-the-loader
+  https://doxygen.reactos.org/d1/d97/ldrtypes_8h_source.html
+  https://geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntldr/ldr_data_table_entry.htm
+
+Подробная статья по отложенной загрузке библиотек:
+  https://learn.microsoft.com/en-us/cpp/build/reference/understanding-the-helper-function?view=msvc-170
+
+О порядке поиска библиотек динамической компоновки:
+  https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order
+
+Для любителей погрузиться в тему, информация о методе динамического переключения контекста кода:
+  https://rce.co/knockin-on-heavens-gate-dynamic-processor-mode-switching/
+  https://www.codeproject.com/Articles/5262969/How-to-Hook-64-Bit-Code-from-WOW64-32-Bit-Mode
+
+Вообще задумка получилась достаточно удобной, полгода назад, когда я реализовал первый вариант данного фреймворка я тестировал его на многих процессах, запущенных у меня на виртуалках и он четко показывал как тот-же офис, или браузеры делают у себя внутри "песочницу" чтобы не допустить побега кода наружу, перехватывая кучу функций на самих себя. Или как идет работа с отложеным импортом с перенаправлениями на заглушки просто выставляющие код ошибки (в дельфи штатно такое не получится сделать - только ручками). Ну или показывал работу защиты ПО, например высвечивая перехват DbgUiRemoteBreakin с перенаправлением на TerminateProcess (типа защита от аттача отладчика к активному процессу) :)
+
+Код для восьмой главы в принципе является абсолютно самодостаточным и его можно спокойно использовать в собственных проектах, или можно взять уже расширенную версию данного кода, которую я применяю в своих проектах. 
+В ней уже есть работа с внешним дизассемблером, логирование, фильтрация и многое другое.
+Финальный вариант фреймворка включен в состав более обширного по возможностям опенсорсного продукта Process Memory Map (PMM), задача которого максимально знать что происходит в удаленных процессах и выводить это в читаемом виде, кстати именно с него делались все скриншоты к статье.
+
+https://github.com/AlexanderBagel/ProcessMemoryMap
+
+РММ является одним из моих основных инструментов в повседневной работе и на текущий момент времени в него добавлена вся информация, которая когда либо мне была нужна в процессе разработки. В планах конечно еще много что есть, потихонечку буду расширять, но не все сразу. 
+
+Засим откланиваюсь.
+
+That's all, folks. Peace off.
+
+Если вы читаете этот текст, значит вы прочли статью внимательно и до конца.
